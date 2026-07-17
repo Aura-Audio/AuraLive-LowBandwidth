@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Low-Bandwidth Audio Share</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #121214;
+            color: #e1e1e6;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+        }
+        .card {
+            background: #202024;
+            padding: 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        h2 { margin-top: 0; color: #4ade80; }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+        }
+        button {
+            background: #04d361;
+            color: #000;
+            border: none;
+            padding: 12px 20px;
+            font-weight: bold;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background: #00b34d; }
+        button:disabled { background: #4d4d56; color: #8d8d99; cursor: not-allowed; }
+        .status {
+            padding: 10px;
+            background: #29292e;
+            border-left: 4px solid #4ade80;
+            font-size: 0.9rem;
+            margin-top: 15px;
+        }
+        audio { width: 100%; margin-top: 15px; display: block; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>WebRTC Audio Streamer</h2>
+    <p style="color: #8d8d99; font-size: 0.9rem;">
+        Click Start, then make sure to select a tab/screen and check <strong>"Share system audio"</strong>.
+    </p>
+
+    <div class="controls">
+        <label>
+            <input type="checkbox" id="lowBandwidthCodec" checked>
+            Force Low-Bandwidth Mode (Opus Narrowband ~12kbps + DTX)
+        </label>
+        
+        <button id="startBtn">1. Capture & Stream Audio</button>
+    </div>
+
+    <div class="status" id="statusLog">Status: Idle</div>
+
+    <h3 style="margin-top: 25px;">Receiver Playback</h3>
+    <!-- Muted by default to prevent a harsh audio feedback loop on the same device -->
+    <audio id="remoteAudio" controls autoplay muted></audio>
+    <p style="color: #f75a68; font-size: 0.8rem; margin-top: 5px;">
+        *Note: Receiver is muted initially to prevent an immediate echo loop on your laptop speakers. Unmute with care!
+    </p>
+</div>
+
+<script>
+let localStream = null;
+let peerConnectionSender = null;
+let peerConnectionReceiver = null;
+
+const startBtn = document.getElementById('startBtn');
+const lowBandwidthCodecCheckbox = document.getElementById('lowBandwidthCodec');
+const statusLog = document.getElementById('statusLog');
+const remoteAudio = document.getElementById('remoteAudio');
+
+function log(msg) {
+    statusLog.innerText = `Status: ${msg}`;
+    console.log(msg);
+}
+
+// Function to alter the SDP packet to limit Opus bandwidth parameters
+function applyLowBandwidthSDP(sdp) {
+    let lines = sdp.split('\r\n');
+    
+    for (let i = 0; i < lines.length; i++) {
+        // Find the Opus codec payload line (usually look for a=rtpmap:111 opus/48000/2)
+        if (lines[i].includes("opus/48000")) {
+            let match = lines[i].match(/a=rtpmap:(\d+)/);
+            if (match) {
+                let payloadType = match[1];
+                // Target the fmtp line matching this payload type to tweak behavior
+                for (let j = 0; j < lines.length; j++) {
+                    if (lines[j].includes(`a=fmtp:${payloadType}`)) {
+                        // Maxout at 12000 bps (Narrowband/speech optimized), force mono, enable DTX (silence suppression)
+                        lines[j] = `a=fmtp:${payloadType} maxaveragebitrate=12000;stereo=0;useinbandfec=1;usedtx=1`;
+                        log("SDP hacked: Applied low-bandwidth configurations to Opus codec.");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return lines.join('\r\n');
+}
+
+async function startStreaming() {
+    try {
+        log("Requesting display share with audio...");
+        
+        // getDisplayMedia handles system/laptop audio capturing
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true, // video track is required by browsers to prompt for display share
+            audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false
+            }
+        });
+
+        // Isolate the system audio track
+        const audioTracks = displayStream.getAudioTracks();
+        if (audioTracks.length === 0) {
+            // Terminate the unused video track if user forgot to check the audio box
+            displayStream.getTracks().forEach(t => t.stop());
+            alert("Error: You must check the 'Share system audio' checkbox in the popup window.");
+            log("Failed: Audio sharing checkbox missed.");
+            return;
+        }
+
+        // Kill the video track right away since we only want to stream the laptop audio
+        displayStream.getVideoTracks().forEach(track => track.stop());
+        
+        localStream = new MediaStream([audioTracks[0]]);
+        log("System audio track isolated successfully.");
+
+        // Setup the local and remote P2P simulation loopback connection
+        const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        peerConnectionSender = new RTCPeerConnection(configuration);
+        peerConnectionReceiver = new RTCPeerConnection(configuration);
+
+        // Handle signaling ICE exchange locally
+        peerConnectionSender.onicecandidate = e => e.candidate && peerConnectionReceiver.addIceCandidate(e.candidate);
+        peerConnectionReceiver.onicecandidate = e => e.candidate && peerConnectionSender.addIceCandidate(e.candidate);
+
+        // Bind incoming stream to audio tag
+        peerConnectionReceiver.ontrack = (event) => {
+            log("Stream received by target peer.");
+            remoteAudio.srcObject = event.streams[0];
+        };
+
+        // Pass the captured laptop audio track to the sender connection
+        localStream.getTracks().forEach(track => peerConnectionSender.addTrack(track, localStream));
+
+        // Create the initial WebRTC connection offer
+        let offer = await peerConnectionSender.createOffer();
+        
+        if (lowBandwidthCodecCheckbox.checked) {
+            offer.sdp = applyLowBandwidthSDP(offer.sdp);
+        }
+
+        await peerConnectionSender.setLocalDescription(offer);
+        await peerConnectionReceiver.setRemoteDescription(peerConnectionSender.localDescription);
+
+        let answer = await peerConnectionReceiver.createAnswer();
+        await peerConnectionReceiver.setLocalDescription(answer);
+        await peerConnectionSender.setRemoteDescription(peerConnectionReceiver.localDescription);
+
+        log("Connected! Audio is routing through WebRTC peer tunnel.");
+        startBtn.disabled = true;
+
+    } catch (err) {
+        console.error(err);
+        log(`Error: ${err.message}`);
+    }
+}
+
+startBtn.addEventListener('click', startStreaming);
+</script>
+</body>
+</html>
