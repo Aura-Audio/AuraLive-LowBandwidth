@@ -1,5 +1,7 @@
 # WebRTC Low-Bandwidth Laptop Audio Streamer
 
+Project - Backup - https://vdo.ninja./?push=kZuNmdH
+
 A lightweight, single-page browser application that uses WebRTC to capture and stream system/laptop audio while aggressively optimizing for low-bandwidth environments.
 
 Typical WebRTC audio configurations default to high-fidelity stereo streaming (~64kbps+). This project demonstrates how to hook into system media layers via browser APIs and modify the underlying **Session Description Protocol (SDP)** to force WebRTC's native **Opus** codec into a strict, highly efficient narrowband speech profile (~12kbps) with silence suppression.
